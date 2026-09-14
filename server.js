@@ -1,149 +1,26 @@
-const express = require("express");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
-const dotenv = require("dotenv");
-const { google } = require("googleapis");
-
-dotenv.config();
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-const uploadDir = path.join(__dirname, "uploads");
-fs.mkdirSync(uploadDir, { recursive: true });
-
-const upload = multer({
-  dest: uploadDir,
-  limits: { fileSize: 20 * 1024 * 1024 * 1024 } // 20 GB
-});
-
-const BASE_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-const REDIRECT_URI = `${BASE_URL}/oauth2callback`;
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  REDIRECT_URI
-);
-
-const TOKEN_FILE = path.join(__dirname, "tokens.json");
-if (fs.existsSync(TOKEN_FILE)) {
-  oauth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")));
-}
-
+require("dotenv").config();
+const express=require("express"),multer=require("multer"),fs=require("fs"),path=require("path"),{google}=require("googleapis");
+const app=express(),PORT=process.env.PORT||3000,dir=path.join(__dirname,"uploads");
+fs.mkdirSync(dir,{recursive:true});
+const upload=multer({dest:dir,limits:{fileSize:20*1024*1024*1024}});
+const base=process.env.RENDER_EXTERNAL_URL||`http://localhost:${PORT}`,redirectUri=`${base}/oauth2callback`;
+const oauth=new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID,process.env.GOOGLE_CLIENT_SECRET,redirectUri);
+const tokenFile=path.join(__dirname,"tokens.json");
+if(fs.existsSync(tokenFile))try{oauth.setCredentials(JSON.parse(fs.readFileSync(tokenFile)))}catch{}
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-
-app.get("/auth", (req, res) => {
-  const url = oauth2Client.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: ["https://www.googleapis.com/auth/youtube.upload"]
-  });
-  res.redirect(url);
+app.get("/",(q,s)=>s.sendFile(path.join(__dirname,"index.html")));
+app.get("/auth",(q,s)=>s.redirect(oauth.generateAuthUrl({access_type:"offline",prompt:"consent",scope:["https://www.googleapis.com/auth/youtube.upload"]})));
+app.get("/oauth2callback",async(q,s)=>{try{const {tokens}=await oauth.getToken(q.query.code);oauth.setCredentials(tokens);fs.writeFileSync(tokenFile,JSON.stringify(tokens));s.redirect("/?connected=1")}catch(e){console.error(e.response?.data||e);s.status(500).send("YouTube authorization failed. Check Render logs.")}});
+app.get("/api/status",async(q,s)=>{try{if(!fs.existsSync(tokenFile))return s.json({connected:false});oauth.setCredentials(JSON.parse(fs.readFileSync(tokenFile)));const y=google.youtube({version:"v3",auth:oauth}),r=await y.channels.list({part:["snippet"],mine:true}),c=r.data.items?.[0];s.json({connected:!!c,channel:c?{id:c.id,title:c.snippet.title}:null})}catch(e){s.json({connected:false})}});
+app.post("/api/upload",upload.fields([{name:"video",maxCount:1},{name:"thumbnail",maxCount:1}]),async(q,s)=>{
+let v=q.files?.video?.[0],t=q.files?.thumbnail?.[0];
+try{if(!fs.existsSync(tokenFile))return s.status(401).json({error:"Connect YouTube first."});oauth.setCredentials(JSON.parse(fs.readFileSync(tokenFile)));
+const y=google.youtube({version:"v3",auth:oauth}),privacy=["public","unlisted","private"].includes(q.body.privacy)?q.body.privacy:"private",tags=(q.body.tags||"").split(",").map(x=>x.trim()).filter(Boolean);
+if(!v)return s.status(400).json({error:"Video is required."});
+const r=await y.videos.insert({part:["snippet","status"],requestBody:{snippet:{title:q.body.title||"Untitled",description:q.body.description||"",tags},status:{privacyStatus:privacy}},media:{body:fs.createReadStream(v.path)}});
+if(t&&r.data.id)await y.thumbnails.set({videoId:r.data.id,media:{mimeType:t.mimetype,body:fs.createReadStream(t.path)}});
+s.json({success:true,videoId:r.data.id,url:`https://www.youtube.com/watch?v=${r.data.id}`});
+}catch(e){console.error(e.response?.data||e);s.status(500).json({error:e.response?.data?.error?.message||"YouTube upload failed."})}
+finally{for(const f of [v,t])if(f?.path)try{fs.unlinkSync(f.path)}catch{}}
 });
-
-app.get("/oauth2callback", async (req, res) => {
-  try {
-    const { tokens } = await oauth2Client.getToken(req.query.code);
-    oauth2Client.setCredentials(tokens);
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
-    res.redirect("/?connected=1");
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("YouTube authorization failed. Check the terminal.");
-  }
-});
-
-app.get("/api/status", async (req, res) => {
-  try {
-    if (!fs.existsSync(TOKEN_FILE)) return res.json({ connected: false });
-    oauth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")));
-    const youtube = google.youtube({ version: "v3", auth: oauth2Client });
-    const result = await youtube.channels.list({
-      part: ["snippet"],
-      mine: true
-    });
-    const channel = result.data.items?.[0];
-    res.json({
-      connected: !!channel,
-      channel: channel ? {
-        title: channel.snippet.title,
-        id: channel.id
-      } : null
-    });
-  } catch (err) {
-    res.json({ connected: false, error: "Authorization expired or invalid." });
-  }
-});
-
-app.post("/api/upload", upload.fields([
-  { name: "video", maxCount: 1 },
-  { name: "thumbnail", maxCount: 1 }
-]), async (req, res) => {
-  try {
-    if (!fs.existsSync(TOKEN_FILE)) {
-      return res.status(401).json({ error: "Connect YouTube first." });
-    }
-
-    oauth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")));
-    const youtube = google.youtube({ version: "v3", auth: oauth2Client });
-
-    const videoFile = req.files?.video?.[0];
-    if (!videoFile) return res.status(400).json({ error: "Video is required." });
-
-    const privacy = ["public", "unlisted", "private"].includes(req.body.privacy)
-      ? req.body.privacy : "private";
-
-    const tags = (req.body.tags || "")
-      .split(",").map(s => s.trim()).filter(Boolean);
-
-    const result = await youtube.videos.insert({
-      part: ["snippet", "status"],
-      requestBody: {
-        snippet: {
-          title: req.body.title || "Untitled",
-          description: req.body.description || "",
-          tags
-        },
-        status: {
-          privacyStatus: privacy
-        }
-      },
-      media: {
-        body: fs.createReadStream(videoFile.path)
-      }
-    });
-
-    const videoId = result.data.id;
-
-    const thumb = req.files?.thumbnail?.[0];
-    if (thumb && videoId) {
-      await youtube.thumbnails.set({
-        videoId,
-        media: {
-          mimeType: thumb.mimetype,
-          body: fs.createReadStream(thumb.path)
-        }
-      });
-    }
-
-    for (const f of [videoFile, thumb].filter(Boolean)) {
-      try { fs.unlinkSync(f.path); } catch {}
-    }
-
-    res.json({
-      success: true,
-      videoId,
-      url: `https://www.youtube.com/watch?v=${videoId}`
-    });
-  } catch (err) {
-    console.error(err?.response?.data || err);
-    res.status(500).json({
-      error: err?.response?.data?.error?.message || "Upload failed. Check the terminal."
-    });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`YT Admin running at http://localhost:${PORT}`);
-});
+app.listen(PORT,()=>console.log("YT Admin running; OAuth:",redirectUri));

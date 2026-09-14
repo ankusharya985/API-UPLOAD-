@@ -1,1 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YT Admin</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui;background:#111;color:#eee}
+main{max-width:760px;margin:40px auto;padding:24px}h1{margin-bottom:6px}
+.card{background:#1b1b1b;border:1px solid #333;border-radius:16px;padding:22px;margin-top:20px}
+label{display:block;margin:14px 0 7px;font-weight:600}
+input,textarea,select{width:100%;padding:12px;border-radius:10px;border:1px solid #444;background:#101010;color:#fff}
+textarea{min-height:130px;resize:vertical}button{margin-top:18px;padding:12px 18px;border:0;border-radius:10px;cursor:pointer;font-weight:700}
+.connect{background:#fff;color:#111}.publish{background:#ff0033;color:white;width:100%}
+#status{margin-top:12px;color:#aaa}.ok{color:#65d48a!important}.error{color:#ff7777!important}
+</style>
+</head>
+<body>
+<main>
+<h1>🎬 YT Admin</h1>
+<p>Simple YouTube uploader — local first.</p>
 
+<div class="card">
+  <button class="connect" onclick="location.href='/auth'">🔗 Connect YouTube</button>
+  <div id="status">Checking connection…</div>
+</div>
+
+<div class="card">
+  <form id="form">
+    <label>Video *</label>
+    <input name="video" type="file" accept="video/*" required>
+
+    <label>Thumbnail</label>
+    <input name="thumbnail" type="file" accept="image/*">
+
+    <label>Title *</label>
+    <input name="title" maxlength="100" required>
+
+    <label>Description</label>
+    <textarea name="description"></textarea>
+
+    <label>Tags (comma separated)</label>
+    <input name="tags" placeholder="music, song, official">
+
+    <label>Visibility</label>
+    <select name="privacy">
+      <option value="private">Private</option>
+      <option value="unlisted">Unlisted</option>
+      <option value="public">Public</option>
+    </select>
+
+    <button class="publish" type="submit">🚀 Upload to YouTube</button>
+  </form>
+  <div id="result"></div>
+</div>
+</main>
+<script>
+async function check(){
+  const s=document.getElementById("status");
+  const r=await fetch("/api/status"); const d=await r.json();
+  if(d.connected){s.textContent="✅ Connected: "+d.channel.title;s.className="ok"}
+  else{s.textContent="❌ YouTube not connected";s.className="error"}
+}
+document.getElementById("form").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const result=document.getElementById("result");
+  result.textContent="Uploading… keep this tab open.";
+  const data=new FormData(e.target);
+  try{
+    const r=await fetch("/api/upload",{method:"POST",body:data});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error);
+    result.innerHTML=`<p class="ok">✅ Uploaded!</p><p><a target="_blank" href="${d.url}">Open on YouTube</a></p>`;
+    e.target.reset();
+  }catch(err){result.innerHTML=`<p class="error">❌ ${err.message}</p>`}
+});
+check();
+</script>
+</body>
+</html>

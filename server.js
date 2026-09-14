@@ -10,11 +10,17 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const MAX_CHANNELS = 7;
 
-// IMPORTANT: upload + read channel information.
+// YouTube scopes: upload + read channel information.
 const SCOPES = [
   "https://www.googleapis.com/auth/youtube.upload",
   "https://www.googleapis.com/auth/youtube.readonly"
 ];
+
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+
+if (!ADMIN_PASSWORD) {
+  console.warn("WARNING: ADMIN_PASSWORD is not set. Admin login will be unavailable.");
+}
 
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -41,30 +47,7 @@ function readDB() {
 function writeDB(db) {
   fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
 }
-function makeOAuth() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    redirectUri
-  );
-}
-async function getChannelInfo(oauth) {
-  const youtube = google.youtube({ version: "v3", auth: oauth });
-  const r = await youtube.channels.list({
-    part: ["snippet", "statistics"],
-    mine: true
-  });
-  const c = r.data.items?.[0];
-  if (!c) return null;
-  return {
-    channelId: c.id,
-    title: c.snippet?.title || "YouTube Channel",
-    thumbnail: c.snippet?.thumbnails?.high?.url || c.snippet?.thumbnails?.default?.url || "",
-    subscribers: c.statistics?.subscriberCount || "0",
-    videos: c.statistics?.videoCount || "0",
-    views: c.statistics?.viewCount || "0"
-  };
-}
+
 function publicChannel(c) {
   return {
     slot: c.slot,
@@ -76,9 +59,116 @@ function publicChannel(c) {
   };
 }
 
-app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
+function makeOAuth() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri
+  );
+}
+
+async function getChannelInfo(oauth) {
+  const youtube = google.youtube({ version: "v3", auth: oauth });
+  const r = await youtube.channels.list({
+    part: ["snippet", "statistics"],
+    mine: true
+  });
+  const c = r.data.items?.[0];
+  if (!c) return null;
+
+  return {
+    channelId: c.id,
+    title: c.snippet?.title || "YouTube Channel",
+    thumbnail: c.snippet?.thumbnails?.high?.url ||
+               c.snippet?.thumbnails?.default?.url || "",
+    subscribers: c.statistics?.subscriberCount || "0",
+    videos: c.statistics?.videoCount || "0",
+    views: c.statistics?.viewCount || "0"
+  };
+}
+
+// =====================================================
+// SIMPLE SECURE ADMIN SESSION
+// =====================================================
+
+const sessions = new Map();
+const SESSION_TTL = 24 * 60 * 60 * 1000;
+
+function createSession() {
+  const token = crypto.randomBytes(32).toString("hex");
+  sessions.set(token, Date.now() + SESSION_TTL);
+  return token;
+}
+
+function isValidSession(token) {
+  if (!token) return false;
+  const expires = sessions.get(token);
+  if (!expires) return false;
+  if (Date.now() > expires) {
+    sessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function requireAdmin(req, res, next) {
+  const token = req.headers["x-admin-session"];
+  if (!isValidSession(token)) {
+    return res.status(401).json({ error: "Admin login required." });
+  }
+  next();
+}
+
+// Login endpoint
+app.post("/api/login", (req, res) => {
+  if (!ADMIN_PASSWORD) {
+    return res.status(500).json({ error: "ADMIN_PASSWORD is not configured on the server." });
+  }
+
+  const password = String(req.body.password || "");
+
+  if (!crypto.timingSafeEqual(
+    Buffer.from(password),
+    Buffer.from(ADMIN_PASSWORD)
+  )) {
+    return res.status(401).json({ error: "Incorrect password." });
+  }
+
+  const token = createSession();
+
+  res.json({
+    success: true,
+    token
+  });
+});
+
+app.post("/api/logout", (req, res) => {
+  const token = req.headers["x-admin-session"];
+  if (token) sessions.delete(token);
+  res.json({ success: true });
+});
+
+app.get("/api/auth-status", (req, res) => {
+  res.json({ loggedIn: isValidSession(req.headers["x-admin-session"]) });
+});
+
+// =====================================================
+// PUBLIC HOME = LOGIN SCREEN
+// =====================================================
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
+
+// =====================================================
+// PROTECTED OAUTH CONNECTION
+// =====================================================
 
 app.get("/auth/:slot", (req, res) => {
+  if (!isValidSession(req.headers["x-admin-session"])) {
+    return res.redirect("/");
+  }
+
   const slot = Number(req.params.slot);
   if (!Number.isInteger(slot) || slot < 1 || slot > MAX_CHANNELS)
     return res.status(400).send("Invalid channel slot.");
@@ -88,35 +178,43 @@ app.get("/auth/:slot", (req, res) => {
     nonce: crypto.randomBytes(16).toString("hex")
   })).toString("base64url");
 
+  // Put session token into state so callback can restore login.
+  const sessionToken = req.headers["x-admin-session"];
+  const stateWithSession = Buffer.from(JSON.stringify({
+    slot,
+    nonce: crypto.randomBytes(16).toString("hex"),
+    sessionToken
+  })).toString("base64url");
+
   const oauth = makeOAuth();
   const authUrl = oauth.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
     include_granted_scopes: true,
     scope: SCOPES,
-    state
+    state: stateWithSession
   });
 
-  console.log(`Starting OAuth for slot ${slot}`);
-  console.log("OAuth redirect URI:", redirectUri);
   res.redirect(authUrl);
 });
 
 app.get("/oauth2callback", async (req, res) => {
   try {
-    if (req.query.error) {
-      return res.status(400).send(`Google authorization cancelled/failed: ${req.query.error}`);
-    }
-    if (!req.query.code || !req.query.state)
-      return res.status(400).send("Authorization data missing.");
+    if (req.query.error) return res.redirect("/?error=oauth_cancelled");
+    if (!req.query.code || !req.query.state) return res.status(400).send("Authorization data missing.");
 
     const state = JSON.parse(
       Buffer.from(req.query.state, "base64url").toString("utf8")
     );
+
     const slot = Number(state.slot);
+    const sessionToken = state.sessionToken;
 
     if (!Number.isInteger(slot) || slot < 1 || slot > MAX_CHANNELS)
       return res.status(400).send("Invalid channel slot.");
+
+    if (!isValidSession(sessionToken))
+      return res.status(401).send("Admin session expired. Please log in again.");
 
     const oauth = makeOAuth();
     const { tokens } = await oauth.getToken(req.query.code);
@@ -141,7 +239,6 @@ app.get("/oauth2callback", async (req, res) => {
     db.channels.sort((a, b) => a.slot - b.slot);
     writeDB(db);
 
-    console.log(`Slot ${slot} connected to ${info.title}`);
     res.redirect("/?connected=1");
   } catch (err) {
     console.error("OAuth callback error:", err.response?.data || err);
@@ -149,11 +246,15 @@ app.get("/oauth2callback", async (req, res) => {
   }
 });
 
-app.get("/api/channels", async (req, res) => {
+// =====================================================
+// PROTECTED CHANNEL API
+// =====================================================
+
+app.get("/api/channels", requireAdmin, async (req, res) => {
   const db = readDB();
   db.channels = db.channels || [];
-
   const channels = [];
+
   for (let slot = 1; slot <= MAX_CHANNELS; slot++) {
     const c = db.channels.find(x => x.slot === slot);
 
@@ -178,8 +279,7 @@ app.get("/api/channels", async (req, res) => {
       } else {
         channels.push({ ...publicChannel(c), connected: false });
       }
-    } catch (err) {
-      console.error(`Status error slot ${slot}:`, err.response?.data || err.message);
+    } catch {
       channels.push({ ...publicChannel(c), connected: false });
     }
   }
@@ -188,7 +288,7 @@ app.get("/api/channels", async (req, res) => {
   res.json({ channels });
 });
 
-app.post("/api/channels/:slot/toggle", (req, res) => {
+app.post("/api/channels/:slot/toggle", requireAdmin, (req, res) => {
   const slot = Number(req.params.slot);
   if (!Number.isInteger(slot) || slot < 1 || slot > MAX_CHANNELS)
     return res.status(400).json({ error: "Invalid slot." });
@@ -204,8 +304,13 @@ app.post("/api/channels/:slot/toggle", (req, res) => {
   res.json({ success: true, enabled: c.enabled });
 });
 
+// =====================================================
+// PROTECTED MULTI-CHANNEL UPLOAD
+// =====================================================
+
 app.post(
   "/api/upload",
+  requireAdmin,
   upload.fields([
     { name: "video", maxCount: 1 },
     { name: "thumbnail", maxCount: 1 }
@@ -215,8 +320,7 @@ app.post(
     const thumbnailFile = req.files?.thumbnail?.[0];
 
     try {
-      if (!videoFile)
-        return res.status(400).json({ error: "Video is required." });
+      if (!videoFile) return res.status(400).json({ error: "Video is required." });
 
       const db = readDB();
       const targets = (db.channels || []).filter(c => c.tokens && c.enabled);
@@ -294,7 +398,10 @@ app.post(
         }
       }
 
-      res.json({ success: results.some(x => x.success), results });
+      res.json({
+        success: results.some(x => x.success),
+        results
+      });
     } catch (err) {
       console.error("Multi upload error:", err);
       res.status(500).json({ error: err.message || "Upload failed." });
@@ -306,11 +413,9 @@ app.post(
   }
 );
 
-app.get("/health", (req, res) =>
-  res.json({ status: "ok", service: "YT Admin 7 Channel", redirectUri })
-);
+app.get("/health", (req, res) => res.json({ status: "ok", service: "YT Admin 7 Channel Secure" }));
 
 app.listen(PORT, () => {
-  console.log("YT Admin 7 Channel running on port", PORT);
+  console.log("YT Admin 7 Channel Secure running on port", PORT);
   console.log("OAuth redirect:", redirectUri);
 });

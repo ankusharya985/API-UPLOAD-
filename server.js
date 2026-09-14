@@ -17,7 +17,8 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 * 1024 } // 20 GB
 });
 
-const REDIRECT_URI = `http://localhost:${PORT}/oauth2callback`;
+const BASE_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const REDIRECT_URI = `${BASE_URL}/oauth2callback`;
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,

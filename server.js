@@ -37,6 +37,23 @@ app.use(express.static(path.join(__dirname,"public")));
 
 const baseUrl=(process.env.RENDER_EXTERNAL_URL||`http://localhost:${PORT}`).replace(/\/$/,"");
 const redirectUri=`${baseUrl}/oauth2callback`;
+const metaBaseUrl=`${baseUrl}/meta`;
+const META_GRAPH_VERSION=process.env.META_GRAPH_VERSION||"v23.0";
+const META_APP_ID=process.env.META_APP_ID||"";
+const META_APP_SECRET=process.env.META_APP_SECRET||"";
+const META_CONFIG_ID=process.env.META_CONFIG_ID||"";
+const META_REDIRECT_URI=`${baseUrl}/meta/oauth/callback`;
+const META_SCOPES=(process.env.META_SCOPES||"pages_show_list,pages_read_engagement,publish_video,instagram_basic,instagram_content_publish,business_management").split(",").map(s=>s.trim()).filter(Boolean);
+const socialFile=path.join(dataDir,"social.json");
+function socialRead(){try{return JSON.parse(fs.readFileSync(socialFile,"utf8"))}catch{return{facebook:[],instagram:[]}}}
+function socialWrite(db){fs.writeFileSync(socialFile,JSON.stringify(db,null,2))}
+function metaUrl(pathname,params={}){const u=new URL(`https://graph.facebook.com/${META_GRAPH_VERSION}${pathname}`);for(const [k,v] of Object.entries(params))if(v!==undefined&&v!==null)u.searchParams.set(k,String(v));return u}
+async function metaJson(pathname,params={},options={}){const u=metaUrl(pathname,params);const r=await fetch(u,{method:options.method||"GET",headers:options.headers||{},body:options.body});const text=await r.text();let data={};try{data=JSON.parse(text)}catch{}if(!r.ok||data.error)throw new Error(data?.error?.message||`Meta API HTTP ${r.status}`);return data}
+function signMetaState(payload){const body=JSON.stringify(payload);const sig=crypto.createHmac("sha256",SESSION_SECRET).update(body).digest("hex");return Buffer.from(JSON.stringify({p:payload,sig})).toString("base64url")}
+function verifyMetaState(raw){const state=JSON.parse(Buffer.from(String(raw),"base64url").toString("utf8"));const body=JSON.stringify(state.p);const sig=crypto.createHmac("sha256",SESSION_SECRET).update(body).digest("hex");if(state.sig!==sig||Number(state.p.exp)<Date.now())throw new Error("Meta OAuth state expired or invalid.");return state.p}
+function publicSocial(db){return{facebook:(db.facebook||[]).map(x=>({id:x.id,name:x.name,picture:x.picture||"",connectedAt:x.connectedAt||null})),instagram:(db.instagram||[]).map(x=>({id:x.id,username:x.username||x.name||"Instagram",name:x.name||"Instagram",picture:x.picture||"",pageId:x.pageId||"",connectedAt:x.connectedAt||null}))}}
+function metaMediaToken(filePath){const payload={p:filePath,e:Date.now()+15*60*1000,n:crypto.randomBytes(12).toString("hex")};return signMetaState(payload)}
+
 
 function dbRead(){try{return JSON.parse(fs.readFileSync(dbFile,"utf8"))}catch{return{channels:[]}}}
 function dbWrite(db){fs.writeFileSync(dbFile,JSON.stringify(db,null,2))}
@@ -90,6 +107,51 @@ app.post("/api/logout",(req,res)=>{
   res.json({success:true});
 });
 app.get("/api/auth-status",(req,res)=>res.json({loggedIn:isAdmin(req)}));
+
+app.get("/meta/connect",requireAdmin,(req,res)=>{
+  if(!META_APP_ID||!META_APP_SECRET)return res.status(500).send("Meta integration is not configured on Render. Add META_APP_ID and META_APP_SECRET first.");
+  const payload={nonce:crypto.randomBytes(18).toString("hex"),exp:Date.now()+10*60*1000};
+  const state=signMetaState(payload);
+  const u=new URL(`https://www.facebook.com/${META_GRAPH_VERSION}/dialog/oauth`);
+  u.searchParams.set("client_id",META_APP_ID);u.searchParams.set("redirect_uri",META_REDIRECT_URI);u.searchParams.set("state",state);u.searchParams.set("response_type","code");
+  if(META_CONFIG_ID)u.searchParams.set("config_id",META_CONFIG_ID);else u.searchParams.set("scope",META_SCOPES.join(","));
+  res.redirect(u.toString());
+});
+
+app.get("/meta/oauth/callback",async(req,res)=>{
+  try{
+    if(req.query.error)return res.redirect("/?meta=cancelled");
+    if(!req.query.code||!req.query.state)return res.status(400).send("Meta authorization data missing.");
+    verifyMetaState(req.query.state);
+    const tokenRes=await fetch(metaUrl("/oauth/access_token",{client_id:META_APP_ID,client_secret:META_APP_SECRET,redirect_uri:META_REDIRECT_URI,code:req.query.code}));
+    const tokenText=await tokenRes.text();let tokenData={};try{tokenData=JSON.parse(tokenText)}catch{}
+    if(!tokenRes.ok||tokenData.error)throw new Error(tokenData?.error?.message||"Meta token exchange failed.");
+    const userToken=tokenData.access_token;
+    const pages=await metaJson("/me/accounts",{access_token:userToken,fields:"id,name,access_token,picture,instagram_business_account{id,username,name,profile_picture_url}"});
+    const db=socialRead();db.facebook=db.facebook||[];db.instagram=db.instagram||[];
+    for(const p of pages.data||[]){
+      const existing=db.facebook.find(x=>x.id===p.id);
+      const rec={id:p.id,name:p.name||"Facebook Page",accessToken:p.access_token,picture:p.picture?.data?.url||"",userToken,connectedAt:existing?.connectedAt||new Date().toISOString()};
+      db.facebook=db.facebook.filter(x=>x.id!==p.id);db.facebook.push(rec);
+      const ig=p.instagram_business_account;
+      if(ig?.id){
+        const ie=db.instagram.find(x=>x.id===ig.id);db.instagram=db.instagram.filter(x=>x.id!==ig.id);db.instagram.push({id:ig.id,username:ig.username||ig.name||"Instagram",name:ig.name||ig.username||"Instagram",picture:ig.profile_picture_url||"",pageId:p.id,pageName:p.name||"",accessToken:p.access_token,connectedAt:ie?.connectedAt||new Date().toISOString()});
+      }
+    }
+    socialWrite(db);res.redirect("/?meta=connected");
+  }catch(e){console.error("Meta OAuth callback:",e);res.status(500).send("Meta authorization failed. Check Render logs and Meta permissions.")}
+});
+
+app.get("/api/social",requireAdmin,(req,res)=>res.json(publicSocial(socialRead())));
+app.post("/api/social/disconnect",requireAdmin,(req,res)=>{const {type,id}=req.body||{};const db=socialRead();if(type==="facebook")db.facebook=(db.facebook||[]).filter(x=>x.id!==String(id));if(type==="instagram")db.instagram=(db.instagram||[]).filter(x=>x.id!==String(id));socialWrite(db);res.json({success:true,...publicSocial(db)});});
+
+app.get("/media/:token",async(req,res)=>{
+  try{
+    const p=verifyMetaState(req.params.token);if(!p.p||Number(p.e)<Date.now())return res.status(410).send("Expired media URL");
+    if(!fs.existsSync(p.p))return res.status(404).send("Media not found");
+    res.sendFile(path.resolve(p.p));
+  }catch{return res.status(403).send("Invalid media URL")}
+});
 
 app.get("/auth/:slot",(req,res)=>{
   if(!isAdmin(req))return res.redirect("/");
@@ -173,7 +235,10 @@ app.post("/api/upload",requireAdmin,upload.fields([{name:"video",maxCount:1},{na
   try{
     if(!video)return res.status(400).json({error:"Video is required."});
     const db=dbRead();const targets=(db.channels||[]).filter(c=>c.tokens&&c.enabled);
-    if(!targets.length)return res.status(400).json({error:"Enable at least one connected channel."});
+    const social=socialRead();
+    const fbTargets=(social.facebook||[]).filter(c=>Array.isArray(req.body.facebookPages)&&req.body.facebookPages.includes(c.id));
+    const igTargets=(social.instagram||[]).filter(c=>Array.isArray(req.body.instagramAccounts)&&req.body.instagramAccounts.includes(c.id));
+    if(!targets.length&&!fbTargets.length&&!igTargets.length)return res.status(400).json({error:"Enable at least one YouTube channel or select a Facebook/Instagram account."});
 
     const title=(req.body.title||"Untitled Video").trim();
     const description=req.body.description||"";
@@ -193,6 +258,9 @@ app.post("/api/upload",requireAdmin,upload.fields([{name:"video",maxCount:1},{na
     const synthetic=req.body.syntheticMedia==="true";
     const notify=req.body.notifySubscribers!=="false";
     const recordingDate=req.body.recordingDate?parseDateTime(req.body.recordingDate):null;
+    let facebookPages=[],instagramAccounts=[];try{facebookPages=JSON.parse(req.body.facebookPages||"[]")}catch{}try{instagramAccounts=JSON.parse(req.body.instagramAccounts||"[]")}catch{}
+    const facebookCaption=String(req.body.facebookCaption||description);
+    const instagramCaption=String(req.body.instagramCaption||description);
     let playlistSelection={};
 try { playlistSelection=JSON.parse(req.body.playlistSelection||"{}"); } catch {}
 
@@ -250,6 +318,31 @@ try { playlistSelection=JSON.parse(req.body.playlistSelection||"{}"); } catch {}
         console.error(`upload slot ${c.slot}`,e.response?.data||e);
         results.push({slot:c.slot,title:c.title,success:false,error:e.response?.data?.error?.message||e.message||"Upload failed."});
       }
+    }
+    // Meta social publishing is deliberately isolated from the existing YouTube loop.
+    // If Meta fails, YouTube results remain intact and are still returned.
+    for(const p of fbTargets){
+      try{
+        const u=metaUrl(`/${p.id}/videos`);
+        const form=new FormData();form.append("access_token",p.accessToken);form.append("description",facebookCaption);form.append("published","true");
+        form.append("source",new Blob([fs.readFileSync(video.path)],{type:video.mimetype||"video/mp4"}),path.basename(video.originalname||video.path));
+        const r=await fetch(u,{method:"POST",body:form});const d=await r.json();if(!r.ok||d.error)throw new Error(d?.error?.message||`Facebook HTTP ${r.status}`);
+        results.push({platform:"facebook",title:p.name,success:true,id:d.id,url:`https://www.facebook.com/${d.id}`});
+      }catch(e){console.error("facebook publish",p.id,e);results.push({platform:"facebook",title:p.name,success:false,error:e.message||"Facebook publish failed."})}
+    }
+    for(const ig of igTargets){
+      try{
+        const token=metaMediaToken(video.path);const publicUrl=`${baseUrl}/media/${encodeURIComponent(token)}`;
+        const container=await metaJson(`/${ig.id}/media`,{}, {method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({access_token:ig.accessToken,media_type:"REELS",video_url:publicUrl,caption:instagramCaption})});
+        let status="IN_PROGRESS";let info={};
+        for(let i=0;i<30&&status!="FINISHED";i++){
+          await new Promise(r=>setTimeout(r,2000));info=await metaJson(`/${container.id}`,{access_token:ig.accessToken,fields:"status_code,status"});status=info.status_code||info.status||"";
+          if(status==="ERROR"||status==="EXPIRED")throw new Error(`Instagram media processing ${status}.`);
+        }
+        if(status!=="FINISHED")throw new Error("Instagram media processing timed out. Try again.");
+        const published=await metaJson(`/${ig.id}/media_publish`,{}, {method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({access_token:ig.accessToken,creation_id:container.id})});
+        results.push({platform:"instagram",title:ig.username||ig.name,success:true,id:published.id||container.id});
+      }catch(e){console.error("instagram publish",ig.id,e);results.push({platform:"instagram",title:ig.username||ig.name,success:false,error:e.message||"Instagram publish failed."})}
     }
     res.json({success:results.some(x=>x.success),results});
   }catch(e){console.error("multi upload",e);res.status(500).json({error:e.message||"Upload failed."})}
